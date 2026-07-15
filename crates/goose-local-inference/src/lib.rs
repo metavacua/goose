@@ -7,6 +7,7 @@ pub mod provider_utils;
 
 mod backend;
 pub mod hf_models;
+mod larql;
 mod llamacpp;
 pub mod local_model_registry;
 pub mod management;
@@ -110,9 +111,11 @@ impl InferenceRuntime {
         }
         let llamacpp_backend: Arc<dyn LocalInferenceBackend> = Arc::new(LlamaCppBackend::new()?);
         let mlx_backend: Arc<dyn LocalInferenceBackend> = Arc::new(MlxBackend::new());
+        let larql_backend: Arc<dyn LocalInferenceBackend> = Arc::new(larql::LarqlBackend::new());
         let mut backends = HashMap::new();
         backends.insert(LLAMACPP_BACKEND_ID, llamacpp_backend);
         backends.insert(MLX_BACKEND_ID, mlx_backend);
+        backends.insert(larql::LARQL_BACKEND_ID, larql_backend);
         let runtime = Arc::new(Self {
             models: StdMutex::new(HashMap::new()),
             cold_load_lock: Mutex::new(()),
