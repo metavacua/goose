@@ -202,7 +202,22 @@ impl LocalInferenceBackend for LarqlBackend {
             )));
         }
 
-        let prompt = flatten_prompt(request.system, request.messages);
+        // Use the lean tiny-model system prompt (same one llamacpp.rs/mlx.rs
+        // substitute for weak local models via their own
+        // load_tiny_model_prompt(), renders prompts/tiny_model_system.md),
+        // not `request.system` verbatim. `request.system` is Goose's full
+        // agentic prompt -- extensions list, <turn-context> block
+        // explanation, response-guidelines section -- built for models that
+        // can actually act on tool instructions. This backend has no
+        // tool-calling support at all yet (see module doc), so that framing
+        // is pure overhead: confirmed empirically that a 135M model fed it
+        // degenerates into echoing fragments of its own prompt back instead
+        // of answering, across multiple runs with different echoed
+        // fragments each time. Rendered directly via `prompt_template`
+        // rather than reusing `tool_emulation::load_tiny_model_prompt()` --
+        // that module is `#[cfg(feature = "mlx")]`-gated and this backend's
+        // build doesn't enable `mlx` (macOS-only Apple MLX bindings).
+        let prompt = flatten_prompt(&tiny_model_prompt(), request.messages);
         writeln!(loaded.stdin, "{prompt}").map_err(|e| {
             ProviderError::ExecutionError(format!("larql backend: failed to write stdin: {e}"))
         })?;
@@ -294,6 +309,38 @@ impl LocalInferenceBackend for LarqlBackend {
             })
             .unwrap_or(0)
     }
+}
+
+/// Same template + context shape as llamacpp's/mlx's own
+/// `load_tiny_model_prompt()`, duplicated here rather than shared because
+/// `tool_emulation` (mlx.rs's source) is `#[cfg(feature = "mlx")]`-gated and
+/// llamacpp's own copy lives in a `pub(super)`-scoped sibling module —
+/// neither is reachable from this crate-root module without depending on a
+/// feature this backend's build doesn't enable.
+fn tiny_model_prompt() -> String {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "unknown"
+    };
+    let working_directory = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let context = serde_json::json!({
+        "os": os,
+        "working_directory": working_directory,
+        "shell": shell,
+    });
+    crate::prompt_template::render_template("tiny_model_system.md", &context).unwrap_or_else(|e| {
+        tracing::warn!("larql backend: failed to load tiny_model_system.md: {e:?}");
+        "You are Goose, an AI assistant. You can execute shell commands by starting lines with $."
+            .to_string()
+    })
 }
 
 fn flatten_prompt(system: &str, messages: &[Message]) -> String {
