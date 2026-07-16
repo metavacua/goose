@@ -281,17 +281,30 @@ impl LocalInferenceBackend for LarqlBackend {
         let mut emulator = crate::larql_tool_emulation::LarqlEmulatorParser::new(convention);
 
         let prompt = flatten_prompt(&system_prompt, request.messages);
+        tracing::debug!(
+            prompt_len = prompt.len(),
+            "larql backend: generate() writing prompt to child stdin"
+        );
         writeln!(loaded.stdin, "{prompt}").map_err(|e| {
             ProviderError::ExecutionError(format!("larql backend: failed to write stdin: {e}"))
         })?;
         loaded.stdin.flush().map_err(|e| {
             ProviderError::ExecutionError(format!("larql backend: failed to flush stdin: {e}"))
         })?;
+        tracing::debug!("larql backend: generate() wrote+flushed prompt, entering read loop");
 
         let deadline = Instant::now() + GENERATE_TIMEOUT;
+        let loop_started = Instant::now();
+        let mut read_line_calls: u64 = 0;
         let mut collected = String::new();
         loop {
             if Instant::now() >= deadline {
+                tracing::debug!(
+                    read_line_calls,
+                    collected_len = collected.len(),
+                    elapsed_ms = loop_started.elapsed().as_millis() as u64,
+                    "larql backend: generate() deadline fired"
+                );
                 return Err(ProviderError::ExecutionError(format!(
                     "larql backend: generate() exceeded {}s with no turn-boundary signal — \
                      treating as a fault, not 'still working' (see AC-5)",
@@ -305,11 +318,38 @@ impl LocalInferenceBackend for LarqlBackend {
             // just throttles line delivery for no benefit -- read_line below
             // already blocks appropriately when no line is available yet.
             if loaded.turn_boundary_rx.try_recv().is_ok() {
+                tracing::debug!(
+                    read_line_calls,
+                    collected_len = collected.len(),
+                    elapsed_ms = loop_started.elapsed().as_millis() as u64,
+                    "larql backend: generate() got turn-boundary signal, breaking"
+                );
                 break;
             }
 
+            // DIAGNOSTIC (temporary): this read_line() call has no timeout of
+            // its own -- the deadline check above only runs BEFORE this call,
+            // never DURING it, so a read_line() that blocks past
+            // GENERATE_TIMEOUT defeats the deadline entirely. Logging before
+            // and after each call reveals whether that's what's happening
+            // (a call that starts but never logs its "returned" line means
+            // it's genuinely stuck here, not merely slow elsewhere).
+            read_line_calls += 1;
+            tracing::debug!(
+                read_line_calls,
+                elapsed_ms = loop_started.elapsed().as_millis() as u64,
+                "larql backend: generate() calling stdout.read_line()"
+            );
             let mut line = String::new();
-            match loaded.stdout.read_line(&mut line) {
+            let read_result = loaded.stdout.read_line(&mut line);
+            tracing::debug!(
+                read_line_calls,
+                elapsed_ms = loop_started.elapsed().as_millis() as u64,
+                result = ?read_result,
+                line_len = line.len(),
+                "larql backend: generate() stdout.read_line() returned"
+            );
+            match read_result {
                 Ok(0) => {
                     // stdout closed — child exited mid-generation.
                     return Err(ProviderError::ExecutionError(
