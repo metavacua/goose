@@ -37,7 +37,10 @@ pub(crate) enum EmulatorConvention {
 pub(crate) enum EmulatedAction {
     Text(String),
     ShellCommand(String),
-    ToolCallJson { name: String, arguments: serde_json::Value },
+    ToolCallJson {
+        name: String,
+        arguments: serde_json::Value,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,12 +132,58 @@ impl LarqlEmulatorParser {
 }
 
 /// Tool-list prompt text, reusing the already-ungated `compact_tools_json` (K41) rather
-/// than duplicating a serialization format.
-pub(crate) fn build_larql_emulator_tool_description(tools: &[Tool]) -> String {
+/// than duplicating a serialization format. Also appends an explicit instruction plus
+/// a concrete few-shot example of the exact convention-specific syntax `push_line`
+/// looks for.
+///
+/// Before this, the prompt only listed the tools' JSON schema and never showed the
+/// model what a correct response actually looks like -- across every /grind retry in
+/// a real CI run (SmolLM2-135M-Instruct, both conventions), the model consistently
+/// narrated ("I'm trying to run the shell command...") instead of ever emitting `$
+/// <command>` or a ` ```tool_call ` fence, regardless of decoding strategy or turn
+/// count. An abstract JSON schema plus a plain-English instruction is exactly the kind
+/// of task a 135M-parameter model is least equipped to generalize from; a worked
+/// example is the more reliable lever for a model this size to imitate a specific
+/// output shape (in-context imitation vs. instruction-following from a spec).
+pub(crate) fn build_larql_emulator_tool_description(
+    tools: &[Tool],
+    convention: EmulatorConvention,
+) -> String {
     let mut desc = String::from("\n\n# Tools\n\nYou have access to the following tools:\n\n");
     if let Some(json) = crate::tool_parsing::compact_tools_json(tools) {
         desc.push_str(&json);
         desc.push('\n');
+    }
+    match convention {
+        EmulatorConvention::ShellCommand => {
+            desc.push_str(
+                "\nTo use the shell tool, respond with EXACTLY one line starting with \
+                 `$` followed by the command. Do not explain what you are about to do, \
+                 do not add any other text -- output only that one line.\n\n\
+                 Example:\n\
+                 User: List the files in the current directory.\n\
+                 Assistant:\n\
+                 $ ls -la\n\n\
+                 Example:\n\
+                 User: Show me the contents of /etc/hostname.\n\
+                 Assistant:\n\
+                 $ cat /etc/hostname\n",
+            );
+        }
+        EmulatorConvention::FencedJson => {
+            desc.push_str(&format!(
+                "\nTo use the shell tool, respond with EXACTLY one fenced code block \
+                 labeled `tool_call` containing a JSON object with \"name\" and \
+                 \"arguments\" fields. Do not explain what you are about to do, do not \
+                 add any other text -- output only that one fenced block.\n\n\
+                 Example:\n\
+                 User: List the files in the current directory.\n\
+                 Assistant:\n\
+                 ```tool_call\n\
+                 {{\"name\": \"{SHELL_TOOL}\", \"arguments\": {{\"command\": \"ls -la\"}}}}\n\
+                 ```\n"
+            ));
+        }
     }
     desc
 }
@@ -150,22 +199,21 @@ pub(crate) fn message_for_action(action: &EmulatedAction) -> Message {
             let tool_call =
                 CallToolRequestParams::new(Cow::Borrowed(SHELL_TOOL)).with_arguments(args);
             let mut message = Message::assistant();
-            message
-                .content
-                .push(MessageContent::tool_request(Uuid::new_v4().to_string(), Ok(tool_call)));
+            message.content.push(MessageContent::tool_request(
+                Uuid::new_v4().to_string(),
+                Ok(tool_call),
+            ));
             message
         }
         EmulatedAction::ToolCallJson { name, arguments } => {
-            let args = arguments
-                .as_object()
-                .cloned()
-                .unwrap_or_default();
+            let args = arguments.as_object().cloned().unwrap_or_default();
             let tool_call =
                 CallToolRequestParams::new(Cow::Owned(name.clone())).with_arguments(args);
             let mut message = Message::assistant();
-            message
-                .content
-                .push(MessageContent::tool_request(Uuid::new_v4().to_string(), Ok(tool_call)));
+            message.content.push(MessageContent::tool_request(
+                Uuid::new_v4().to_string(),
+                Ok(tool_call),
+            ));
             message
         }
     }
@@ -181,7 +229,9 @@ mod tests {
         let action = p.push_line("$ ls -1 /tmp | wc -l");
         assert_eq!(
             action,
-            Some(EmulatedAction::ShellCommand("ls -1 /tmp | wc -l".to_string()))
+            Some(EmulatedAction::ShellCommand(
+                "ls -1 /tmp | wc -l".to_string()
+            ))
         );
     }
 
@@ -191,7 +241,9 @@ mod tests {
         let action = p.push_line("Let me check that for you.");
         assert_eq!(
             action,
-            Some(EmulatedAction::Text("Let me check that for you.".to_string()))
+            Some(EmulatedAction::Text(
+                "Let me check that for you.".to_string()
+            ))
         );
     }
 
@@ -256,5 +308,50 @@ mod tests {
             message.content.first(),
             Some(MessageContent::ToolRequest(_))
         ));
+    }
+
+    // ── few-shot example round-trip: the example shown to the model must
+    // actually be valid input to this same parser, not just plausible-looking
+    // prose. A prompt-engineering example that doesn't parse would be a
+    // completely silent failure -- nothing would ever flag it, since the
+    // description text is never otherwise exercised against the parser it's
+    // meant to teach.
+
+    #[test]
+    fn shell_convention_description_example_line_is_parseable() {
+        let desc = build_larql_emulator_tool_description(&[], EmulatorConvention::ShellCommand);
+        let example_line = desc
+            .lines()
+            .find(|l| l.starts_with('$'))
+            .expect("description must contain a `$ ...` example line");
+        let mut p = LarqlEmulatorParser::new(EmulatorConvention::ShellCommand);
+        let action = p.push_line(example_line);
+        assert!(
+            matches!(action, Some(EmulatedAction::ShellCommand(_))),
+            "the example line in the shell-command tool description must itself \
+             parse as a shell command, got: {action:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_json_convention_description_example_round_trips() {
+        // Feed every line in order, as the parser would see them if the model
+        // echoed this exact description back as its own multi-line response --
+        // the fenced example is appended last, so the final emitted action
+        // should be the ToolCallJson from that fence, not an earlier Text line
+        // from the (empty, in this test) tool-schema JSON preceding it.
+        let desc = build_larql_emulator_tool_description(&[], EmulatorConvention::FencedJson);
+        let mut p = LarqlEmulatorParser::new(EmulatorConvention::FencedJson);
+        let mut action = None;
+        for line in desc.lines() {
+            if let Some(a) = p.push_line(line) {
+                action = Some(a);
+            }
+        }
+        assert!(
+            matches!(action, Some(EmulatedAction::ToolCallJson { .. })),
+            "the fenced example in the fenced-json tool description must itself \
+             parse as a tool call, got: {action:?}"
+        );
     }
 }

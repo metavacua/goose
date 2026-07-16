@@ -70,10 +70,15 @@ struct LarqlLoadedModel {
     stdout_rx: std_mpsc::Receiver<StdoutEvent>,
     /// Fires a message each time the stderr watcher sees a fresh turn prompt.
     turn_boundary_rx: std_mpsc::Receiver<()>,
-    /// Rendered tool description, cached against the tool count that produced
-    /// it -- the tool list is static for the life of a session in practice,
-    /// so re-rendering it on every generate() call is pure waste.
-    cached_tool_description: Option<(usize, String)>,
+    /// Rendered tool description, cached against the tool count and
+    /// convention that produced it -- both are static for the life of a
+    /// session in practice, so re-rendering it on every generate() call is
+    /// pure waste.
+    cached_tool_description: Option<(
+        usize,
+        crate::larql_tool_emulation::EmulatorConvention,
+        String,
+    )>,
 }
 
 impl BackendLoadedModel for LarqlLoadedModel {
@@ -310,28 +315,30 @@ impl LocalInferenceBackend for LarqlBackend {
         // ToolRequest instead of plain text. Convention selectable via
         // LARQL_TOOL_CALL_CONVENTION for the strategy-matrix's leg 1 (shell, default)
         // vs. leg 2 (fenced-json) comparison.
+        let convention = match std::env::var("LARQL_TOOL_CALL_CONVENTION").as_deref() {
+            Ok("fenced-json") => crate::larql_tool_emulation::EmulatorConvention::FencedJson,
+            _ => crate::larql_tool_emulation::EmulatorConvention::ShellCommand,
+        };
         let mut system_prompt = String::new();
         if !request.tools.is_empty() {
-            let needs_rebuild = loaded
-                .cached_tool_description
-                .as_ref()
-                .is_none_or(|(count, _)| *count != request.tools.len());
+            let needs_rebuild = loaded.cached_tool_description.as_ref().is_none_or(
+                |(count, cached_convention, _)| {
+                    *count != request.tools.len() || *cached_convention != convention
+                },
+            );
             if needs_rebuild {
                 let desc = crate::larql_tool_emulation::build_larql_emulator_tool_description(
                     request.tools,
+                    convention,
                 );
-                loaded.cached_tool_description = Some((request.tools.len(), desc));
+                loaded.cached_tool_description = Some((request.tools.len(), convention, desc));
             }
-            let (_, desc) = loaded
+            let (_, _, desc) = loaded
                 .cached_tool_description
                 .as_ref()
                 .expect("just set above");
             system_prompt.push_str(desc);
         }
-        let convention = match std::env::var("LARQL_TOOL_CALL_CONVENTION").as_deref() {
-            Ok("fenced-json") => crate::larql_tool_emulation::EmulatorConvention::FencedJson,
-            _ => crate::larql_tool_emulation::EmulatorConvention::ShellCommand,
-        };
         let mut emulator = crate::larql_tool_emulation::LarqlEmulatorParser::new(convention);
 
         let prompt = flatten_prompt(&system_prompt, request.messages);
