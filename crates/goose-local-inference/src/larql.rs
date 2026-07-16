@@ -90,9 +90,28 @@ impl LocalInferenceBackend for LarqlBackend {
         // where the binary lives; "larql" (plain PATH search) remains the
         // sensible default for a normal interactive/dev environment.
         let larql_bin = std::env::var("LARQL_BIN").unwrap_or_else(|_| "larql".to_string());
+        // LARQL_SYSTEM: without this, `larql chat`'s own render_user_prompt
+        // (crates/larql-inference/src/chat/mod.rs in the larql repo) has no
+        // system-role content of its own, so its default single-user-turn
+        // path (wrap_chat_prompt(vindex_dir, None, user_prompt)) wraps
+        // WHATEVER single line we send as the model's ENTIRE "user" turn --
+        // including our own tiny-model system-prompt text prepended into
+        // that same line by generate()'s prior implementation. Confirmed via
+        // SmolLM2-135M-Instruct's actual chat_template.jinja: a real "user"
+        // role message only ever contains the literal conversation, with the
+        // model's own auto-injected generic default system message ahead of
+        // it -- our system-prompt text arriving *inside* that user message
+        // is a prompt shape the model never saw in training, distinct from
+        // (and likely compounding) any raw capability limit. This is static
+        // for the process's lifetime (tiny_model_prompt() depends only on
+        // OS/cwd/$SHELL, not per-turn state), so setting it once at spawn is
+        // correct -- LARQL_SYSTEM is read fresh via render_user_prompt on
+        // every turn, but the OS-level env var value itself never changes
+        // once this child process starts.
         let mut child = Command::new(&larql_bin)
             .arg("chat")
             .arg(vindex_path)
+            .env("LARQL_SYSTEM", tiny_model_prompt())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -222,14 +241,25 @@ impl LocalInferenceBackend for LarqlBackend {
         // rather than reusing `tool_emulation::load_tiny_model_prompt()` --
         // that module is `#[cfg(feature = "mlx")]`-gated and this backend's
         // build doesn't enable `mlx` (macOS-only Apple MLX bindings).
+        //
+        // NOT re-included here: `tiny_model_prompt()` itself is now conveyed
+        // once via the LARQL_SYSTEM env var set at spawn (see load_model),
+        // so `render_user_prompt` places it in a real system-role message
+        // instead of folding it into the same single "user" turn as the rest
+        // of this text -- confirmed via SmolLM2-135M-Instruct's own
+        // chat_template.jinja that a "user" role message is meant to be pure
+        // conversation, not system instructions plus conversation concatenated.
+        // Only the (per-session, but request-derived) tool description is
+        // built here, since load_model doesn't have request.tools available.
+        //
         // Tool-call emulation (docs/specs/2026-07-16-larql-goose-toolcalling-design.md
-        // ADR-2): when the caller supplied tools, extend the tiny-model prompt with a
+        // ADR-2): when the caller supplied tools, extend this text with a
         // description of them and route each response line through the emulator
         // parser before surfacing it as a message, so a matched line becomes a real
         // ToolRequest instead of plain text. Convention selectable via
         // LARQL_TOOL_CALL_CONVENTION for the strategy-matrix's leg 1 (shell, default)
         // vs. leg 2 (fenced-json) comparison.
-        let mut system_prompt = tiny_model_prompt();
+        let mut system_prompt = String::new();
         if !request.tools.is_empty() {
             let needs_rebuild = loaded
                 .cached_tool_description
