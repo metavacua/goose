@@ -8,6 +8,7 @@ pub mod provider_utils;
 mod backend;
 pub mod hf_models;
 mod larql;
+mod larql_tool_emulation;
 mod llamacpp;
 pub mod local_model_registry;
 pub mod management;

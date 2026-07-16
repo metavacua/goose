@@ -217,7 +217,26 @@ impl LocalInferenceBackend for LarqlBackend {
         // rather than reusing `tool_emulation::load_tiny_model_prompt()` --
         // that module is `#[cfg(feature = "mlx")]`-gated and this backend's
         // build doesn't enable `mlx` (macOS-only Apple MLX bindings).
-        let prompt = flatten_prompt(&tiny_model_prompt(), request.messages);
+        // Tool-call emulation (docs/specs/2026-07-16-larql-goose-toolcalling-design.md
+        // ADR-2): when the caller supplied tools, extend the tiny-model prompt with a
+        // description of them and route each response line through the emulator
+        // parser before surfacing it as a message, so a matched line becomes a real
+        // ToolRequest instead of plain text. Convention selectable via
+        // LARQL_TOOL_CALL_CONVENTION for the strategy-matrix's leg 1 (shell, default)
+        // vs. leg 2 (fenced-json) comparison.
+        let mut system_prompt = tiny_model_prompt();
+        if !request.tools.is_empty() {
+            system_prompt.push_str(&crate::larql_tool_emulation::build_larql_emulator_tool_description(
+                request.tools,
+            ));
+        }
+        let convention = match std::env::var("LARQL_TOOL_CALL_CONVENTION").as_deref() {
+            Ok("fenced-json") => crate::larql_tool_emulation::EmulatorConvention::FencedJson,
+            _ => crate::larql_tool_emulation::EmulatorConvention::ShellCommand,
+        };
+        let mut emulator = crate::larql_tool_emulation::LarqlEmulatorParser::new(convention);
+
+        let prompt = flatten_prompt(&system_prompt, request.messages);
         writeln!(loaded.stdin, "{prompt}").map_err(|e| {
             ProviderError::ExecutionError(format!("larql backend: failed to write stdin: {e}"))
         })?;
@@ -257,16 +276,23 @@ impl LocalInferenceBackend for LarqlBackend {
                 }
                 Ok(_) => {
                     collected.push_str(&line);
-                    let mut message = Message::assistant();
-                    message = message.with_text(line.clone());
-                    let _ = request
-                        .tx
-                        .blocking_send(Ok((Some(message), None)))
-                        .map_err(|_| {
-                            ProviderError::ExecutionError(
-                                "larql backend: stream receiver dropped".to_string(),
-                            )
-                        });
+                    // `None` means the emulator consumed this line without a
+                    // completed action yet (e.g. mid-fence JSON accumulation, or an
+                    // empty `$` with no command) -- correctly suppressed, not
+                    // surfaced as plain text, or the model's in-progress tool-call
+                    // syntax would leak into the visible conversation.
+                    let trimmed = line.trim_end_matches(['\n', '\r']);
+                    if let Some(action) = emulator.push_line(trimmed) {
+                        let message = crate::larql_tool_emulation::message_for_action(&action);
+                        let _ = request
+                            .tx
+                            .blocking_send(Ok((Some(message), None)))
+                            .map_err(|_| {
+                                ProviderError::ExecutionError(
+                                    "larql backend: stream receiver dropped".to_string(),
+                                )
+                            });
+                    }
                 }
                 Err(_) => continue, // transient read error on a non-blocking-ish pipe; retry until deadline
             }
