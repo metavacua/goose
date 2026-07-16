@@ -10,9 +10,15 @@
 //! looks for the next "> " and signals turn completion over a channel. A hard
 //! timeout is the safety net if that signal never arrives (ties to the containing
 //! project's AC-5 liveness requirement — a hung child must not hang generate()
-//! forever). No native tool-calling support yet — `request.tools` is accepted but
-//! unused; ToolRequest/ToolResponse content is flattened to its Display text like
-//! everything else, same fallback llamacpp.rs/mlx.rs use for non-native paths.
+//! forever). No *native* tool-calling API support — `larql chat` has no structured
+//! tool-call protocol to speak to. `request.tools`, when non-empty, IS used: a
+//! text-based emulation layer (`larql_tool_emulation.rs`) describes the tools in
+//! the prompt (with a worked example of the exact expected syntax) and parses the
+//! model's plain-text response for a matching pattern (`$ command` or a fenced
+//! JSON block, depending on `LARQL_TOOL_CALL_CONVENTION`), turning a match into a
+//! real `ToolRequest`. Without a matching pattern, ToolRequest/ToolResponse content
+//! still flattens to its Display text, same fallback llamacpp.rs/mlx.rs use for
+//! non-native paths.
 
 use std::any::Any;
 use std::io::{BufRead, BufReader, Write};
@@ -477,21 +483,23 @@ impl LocalInferenceBackend for LarqlBackend {
 /// Same template-render mechanics as llamacpp's/mlx's own
 /// `load_tiny_model_prompt()` (`crate::prompt_template::render_template`),
 /// but pointed at this backend's own `larql_tiny_model_system.md` rather
-/// than the shared `tiny_model_system.md` -- for two reasons, not just the
+/// than the shared `tiny_model_system.md`, not just for the
 /// `#[cfg(feature = "mlx")]`/`pub(super)` reachability issue noted below:
-///
-/// 1. `tiny_model_system.md` instructs the model to run shell commands via
-///    `$ command` and expect to see real output back. This backend has no
-///    tool-calling support at all yet (see module doc) -- nothing parses or
-///    executes a `$ command` the model emits -- so that instruction would be
-///    actively false for this backend specifically, not just unused.
-/// 2. Confirmed empirically: without a code-output example, a 135M model
-///    given "write a function, output only the code" drifted into listing
-///    test cases instead (its only few-shot example in the shared template
-///    is a shell command, not code). The one added here uses a *different*
-///    function (`multiply`) than any test task, so the model must
-///    generalize the output-shape pattern rather than recall a memorized
-///    answer.
+/// the shared template instructs the model to run shell commands via
+/// `$ command` unconditionally, which is only true for this backend once
+/// tool-calling emulation is active (`larql_tool_emulation.rs`) -- and even
+/// then, having TWO worked examples in play (this file's own code-writing
+/// one plus the tool-call one built by
+/// `build_larql_emulator_tool_description`) actively confused the model:
+/// a real CI run produced a response that tried to "run" a Python function
+/// signature as if it were a shell command, fusing both examples together.
+/// This template intentionally carries NO worked example of its own now --
+/// only the tool description's example, shown when tools are actually
+/// available, teaches an output shape. The risk that reintroduces (a
+/// code-writing request without any example drifting into listing test
+/// cases instead of just the code) is accepted for now; re-add a
+/// code-writing example here only if it can be made to not visually
+/// resemble a shell-command or fenced-tool-call example.
 fn tiny_model_prompt() -> String {
     let context = crate::prompt_template::tiny_model_context();
     crate::prompt_template::render_template("larql_tiny_model_system.md", &context).unwrap_or_else(
