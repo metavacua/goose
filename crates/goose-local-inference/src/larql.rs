@@ -50,6 +50,10 @@ struct LarqlLoadedModel {
     stdout: BufReader<std::process::ChildStdout>,
     /// Fires a message each time the stderr watcher sees a fresh turn prompt.
     turn_boundary_rx: std_mpsc::Receiver<()>,
+    /// Rendered tool description, cached against the tool count that produced
+    /// it -- the tool list is static for the life of a session in practice,
+    /// so re-rendering it on every generate() call is pure waste.
+    cached_tool_description: Option<(usize, String)>,
 }
 
 impl BackendLoadedModel for LarqlLoadedModel {
@@ -179,6 +183,7 @@ impl LocalInferenceBackend for LarqlBackend {
             stdin,
             stdout: BufReader::new(stdout),
             turn_boundary_rx: boundary_rx,
+            cached_tool_description: None,
         }))
     }
 
@@ -226,9 +231,18 @@ impl LocalInferenceBackend for LarqlBackend {
         // vs. leg 2 (fenced-json) comparison.
         let mut system_prompt = tiny_model_prompt();
         if !request.tools.is_empty() {
-            system_prompt.push_str(&crate::larql_tool_emulation::build_larql_emulator_tool_description(
-                request.tools,
-            ));
+            let needs_rebuild = loaded
+                .cached_tool_description
+                .as_ref()
+                .is_none_or(|(count, _)| *count != request.tools.len());
+            if needs_rebuild {
+                let desc = crate::larql_tool_emulation::build_larql_emulator_tool_description(
+                    request.tools,
+                );
+                loaded.cached_tool_description = Some((request.tools.len(), desc));
+            }
+            let (_, desc) = loaded.cached_tool_description.as_ref().expect("just set above");
+            system_prompt.push_str(desc);
         }
         let convention = match std::env::var("LARQL_TOOL_CALL_CONVENTION").as_deref() {
             Ok("fenced-json") => crate::larql_tool_emulation::EmulatorConvention::FencedJson,
@@ -256,11 +270,11 @@ impl LocalInferenceBackend for LarqlBackend {
             }
 
             // Turn complete: the child's next "> " prompt appeared on stderr.
-            if loaded
-                .turn_boundary_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_ok()
-            {
+            // try_recv, not recv_timeout: the boundary fires exactly once per
+            // turn, so blocking here for up to 50ms on every other iteration
+            // just throttles line delivery for no benefit -- read_line below
+            // already blocks appropriately when no line is available yet.
+            if loaded.turn_boundary_rx.try_recv().is_ok() {
                 break;
             }
 
@@ -356,24 +370,7 @@ impl LocalInferenceBackend for LarqlBackend {
 ///    generalize the output-shape pattern rather than recall a memorized
 ///    answer.
 fn tiny_model_prompt() -> String {
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        "unknown"
-    };
-    let working_directory = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let context = serde_json::json!({
-        "os": os,
-        "working_directory": working_directory,
-        "shell": shell,
-    });
+    let context = crate::prompt_template::tiny_model_context();
     crate::prompt_template::render_template("larql_tiny_model_system.md", &context).unwrap_or_else(|e| {
         tracing::warn!("larql backend: failed to load larql_tiny_model_system.md: {e:?}");
         "You are Goose, an AI coding assistant. When asked to write code, output only the code."

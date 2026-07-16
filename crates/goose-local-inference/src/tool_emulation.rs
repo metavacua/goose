@@ -17,30 +17,7 @@ const HOLD_BACK_CODE_MODE: usize = " ```execute_typescript\n".len();
 const HOLD_BACK_SHELL_ONLY: usize = "\n$".len();
 
 pub(crate) fn load_tiny_model_prompt() -> String {
-    use std::env;
-
-    let os = if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        "unknown"
-    };
-
-    let working_directory = env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-
-    let context = json!({
-        "os": os,
-        "working_directory": working_directory,
-        "shell": shell,
-    });
-
+    let context = crate::prompt_template::tiny_model_context();
     crate::prompt_template::render_template("tiny_model_system.md", &context).unwrap_or_else(|e| {
         tracing::warn!("Failed to load tiny_model_system.md: {:?}", e);
         "You are Goose, an AI assistant. You can execute shell commands by starting lines with $."

@@ -41,3 +41,29 @@ pub fn render_template<T: Serialize>(name: &str, context: &T) -> Result<String, 
 
     render_string(&template_str, context)
 }
+
+/// `{os, working_directory, shell}` context for a tiny-model system prompt template.
+/// Shared by every backend's own tiny-model prompt (llamacpp, mlx, larql) — each
+/// renders a different template file with this same context shape, so this is the
+/// one piece worth factoring out rather than duplicating the OS/cwd/`$SHELL`
+/// detection three times over.
+pub fn tiny_model_context() -> serde_json::Value {
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "unknown"
+    };
+    let working_directory = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    serde_json::json!({
+        "os": os,
+        "working_directory": working_directory,
+        "shell": shell,
+    })
+}
