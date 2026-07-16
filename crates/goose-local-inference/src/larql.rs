@@ -311,12 +311,24 @@ impl LocalInferenceBackend for LarqlBackend {
     }
 }
 
-/// Same template + context shape as llamacpp's/mlx's own
-/// `load_tiny_model_prompt()`, duplicated here rather than shared because
-/// `tool_emulation` (mlx.rs's source) is `#[cfg(feature = "mlx")]`-gated and
-/// llamacpp's own copy lives in a `pub(super)`-scoped sibling module —
-/// neither is reachable from this crate-root module without depending on a
-/// feature this backend's build doesn't enable.
+/// Same template-render mechanics as llamacpp's/mlx's own
+/// `load_tiny_model_prompt()` (`crate::prompt_template::render_template`),
+/// but pointed at this backend's own `larql_tiny_model_system.md` rather
+/// than the shared `tiny_model_system.md` -- for two reasons, not just the
+/// `#[cfg(feature = "mlx")]`/`pub(super)` reachability issue noted below:
+///
+/// 1. `tiny_model_system.md` instructs the model to run shell commands via
+///    `$ command` and expect to see real output back. This backend has no
+///    tool-calling support at all yet (see module doc) -- nothing parses or
+///    executes a `$ command` the model emits -- so that instruction would be
+///    actively false for this backend specifically, not just unused.
+/// 2. Confirmed empirically: without a code-output example, a 135M model
+///    given "write a function, output only the code" drifted into listing
+///    test cases instead (its only few-shot example in the shared template
+///    is a shell command, not code). The one added here uses a *different*
+///    function (`multiply`) than any test task, so the model must
+///    generalize the output-shape pattern rather than recall a memorized
+///    answer.
 fn tiny_model_prompt() -> String {
     let os = if cfg!(target_os = "macos") {
         "macos"
@@ -336,9 +348,9 @@ fn tiny_model_prompt() -> String {
         "working_directory": working_directory,
         "shell": shell,
     });
-    crate::prompt_template::render_template("tiny_model_system.md", &context).unwrap_or_else(|e| {
-        tracing::warn!("larql backend: failed to load tiny_model_system.md: {e:?}");
-        "You are Goose, an AI assistant. You can execute shell commands by starting lines with $."
+    crate::prompt_template::render_template("larql_tiny_model_system.md", &context).unwrap_or_else(|e| {
+        tracing::warn!("larql backend: failed to load larql_tiny_model_system.md: {e:?}");
+        "You are Goose, an AI coding assistant. When asked to write code, output only the code."
             .to_string()
     })
 }
