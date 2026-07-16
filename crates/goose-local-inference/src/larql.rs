@@ -44,10 +44,30 @@ impl LarqlBackend {
     }
 }
 
+/// One event from the background stdout-reader thread (see `load_model`'s
+/// spawn of it). `Closed` distinguishes "the pipe hit EOF or errored" from
+/// `RecvTimeoutError::Disconnected` on the channel itself (sender dropped),
+/// though both currently mean the same thing to `generate()`'s caller.
+enum StdoutEvent {
+    Line(String),
+    Closed,
+}
+
 struct LarqlLoadedModel {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    /// Complete lines from the child's stdout, read by a background thread
+    /// (spawned in `load_model`) instead of directly by `generate()`. A
+    /// direct blocking `read_line()` call on the main thread has no timeout
+    /// of its own: GENERATE_TIMEOUT was only checked BETWEEN read_line()
+    /// calls, never during one, so a single slow call defeated the deadline
+    /// entirely -- confirmed via CI instrumentation showing a read_line()
+    /// call that logged "starting" and then never logged "returned" for the
+    /// remainder of a 1200s VM-leg timeout. Routing through this channel and
+    /// polling it with `recv_timeout` in `generate()` lets the deadline be
+    /// re-checked on a fixed short interval regardless of how slow (or
+    /// stuck) the child's own stdout production is.
+    stdout_rx: std_mpsc::Receiver<StdoutEvent>,
     /// Fires a message each time the stderr watcher sees a fresh turn prompt.
     turn_boundary_rx: std_mpsc::Receiver<()>,
     /// Rendered tool description, cached against the tool count that produced
@@ -165,11 +185,42 @@ impl LocalInferenceBackend for LarqlBackend {
                             // Bound memory on unexpectedly chatty/non-matching
                             // stderr; keep only the tail, a prompt can't span
                             // more than a few bytes so nothing meaningful is lost.
+                            // Byte-slice + from_utf8_lossy, not a direct string
+                            // slice: `pending` is UTF-8 text and a raw byte
+                            // offset (pending.len() - 256) isn't guaranteed to
+                            // land on a char boundary, which would panic.
                             let tail_start = pending.len() - 256;
-                            pending = pending[tail_start..].to_string();
+                            pending = String::from_utf8_lossy(&pending.as_bytes()[tail_start..])
+                                .to_string();
                         }
                     }
                     Err(_) => break,
+                }
+            }
+        });
+
+        // Background stdout-reader thread — see LarqlLoadedModel::stdout_rx's
+        // doc comment for why generate() must not call read_line() directly
+        // on the main thread.
+        let (stdout_tx, stdout_rx) = std_mpsc::channel::<StdoutEvent>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = stdout_tx.send(StdoutEvent::Closed);
+                        break;
+                    }
+                    Ok(_) => {
+                        if stdout_tx.send(StdoutEvent::Line(line)).is_err() {
+                            break; // generate()'s receiver dropped; nothing left to do
+                        }
+                    }
+                    Err(_) => {
+                        let _ = stdout_tx.send(StdoutEvent::Closed);
+                        break;
+                    }
                 }
             }
         });
@@ -200,7 +251,7 @@ impl LocalInferenceBackend for LarqlBackend {
         Ok(Box::new(LarqlLoadedModel {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout_rx,
             turn_boundary_rx: boundary_rx,
             cached_tool_description: None,
         }))
@@ -271,7 +322,10 @@ impl LocalInferenceBackend for LarqlBackend {
                 );
                 loaded.cached_tool_description = Some((request.tools.len(), desc));
             }
-            let (_, desc) = loaded.cached_tool_description.as_ref().expect("just set above");
+            let (_, desc) = loaded
+                .cached_tool_description
+                .as_ref()
+                .expect("just set above");
             system_prompt.push_str(desc);
         }
         let convention = match std::env::var("LARQL_TOOL_CALL_CONVENTION").as_deref() {
@@ -293,14 +347,24 @@ impl LocalInferenceBackend for LarqlBackend {
         })?;
         tracing::debug!("larql backend: generate() wrote+flushed prompt, entering read loop");
 
+        // Poll interval for stdout_rx.recv_timeout -- short enough that the
+        // deadline check below re-runs promptly regardless of how slow (or
+        // fully stuck) the child's own token generation is. Confirmed via CI
+        // instrumentation that a direct blocking read_line() call on this
+        // thread had no such bound: GENERATE_TIMEOUT was only checked BETWEEN
+        // calls, never during one, so a single slow/stuck call could consume
+        // the entire outer VM-leg timeout (~1200s observed) with the deadline
+        // never firing at all.
+        const STDOUT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
         let deadline = Instant::now() + GENERATE_TIMEOUT;
         let loop_started = Instant::now();
-        let mut read_line_calls: u64 = 0;
+        let mut poll_count: u64 = 0;
         let mut collected = String::new();
         loop {
             if Instant::now() >= deadline {
                 tracing::debug!(
-                    read_line_calls,
+                    poll_count,
                     collected_len = collected.len(),
                     elapsed_ms = loop_started.elapsed().as_millis() as u64,
                     "larql backend: generate() deadline fired"
@@ -313,13 +377,9 @@ impl LocalInferenceBackend for LarqlBackend {
             }
 
             // Turn complete: the child's next "> " prompt appeared on stderr.
-            // try_recv, not recv_timeout: the boundary fires exactly once per
-            // turn, so blocking here for up to 50ms on every other iteration
-            // just throttles line delivery for no benefit -- read_line below
-            // already blocks appropriately when no line is available yet.
             if loaded.turn_boundary_rx.try_recv().is_ok() {
                 tracing::debug!(
-                    read_line_calls,
+                    poll_count,
                     collected_len = collected.len(),
                     elapsed_ms = loop_started.elapsed().as_millis() as u64,
                     "larql backend: generate() got turn-boundary signal, breaking"
@@ -327,30 +387,9 @@ impl LocalInferenceBackend for LarqlBackend {
                 break;
             }
 
-            // DIAGNOSTIC (temporary): this read_line() call has no timeout of
-            // its own -- the deadline check above only runs BEFORE this call,
-            // never DURING it, so a read_line() that blocks past
-            // GENERATE_TIMEOUT defeats the deadline entirely. Logging before
-            // and after each call reveals whether that's what's happening
-            // (a call that starts but never logs its "returned" line means
-            // it's genuinely stuck here, not merely slow elsewhere).
-            read_line_calls += 1;
-            tracing::debug!(
-                read_line_calls,
-                elapsed_ms = loop_started.elapsed().as_millis() as u64,
-                "larql backend: generate() calling stdout.read_line()"
-            );
-            let mut line = String::new();
-            let read_result = loaded.stdout.read_line(&mut line);
-            tracing::debug!(
-                read_line_calls,
-                elapsed_ms = loop_started.elapsed().as_millis() as u64,
-                result = ?read_result,
-                line_len = line.len(),
-                "larql backend: generate() stdout.read_line() returned"
-            );
-            match read_result {
-                Ok(0) => {
+            poll_count += 1;
+            match loaded.stdout_rx.recv_timeout(STDOUT_POLL_INTERVAL) {
+                Ok(StdoutEvent::Closed) => {
                     // stdout closed — child exited mid-generation.
                     return Err(ProviderError::ExecutionError(
                         "larql backend: child stdout closed before a turn-boundary signal \
@@ -358,7 +397,7 @@ impl LocalInferenceBackend for LarqlBackend {
                             .to_string(),
                     ));
                 }
-                Ok(_) => {
+                Ok(StdoutEvent::Line(line)) => {
                     collected.push_str(&line);
                     // `None` means the emulator consumed this line without a
                     // completed action yet (e.g. mid-fence JSON accumulation, or an
@@ -378,7 +417,14 @@ impl LocalInferenceBackend for LarqlBackend {
                             });
                     }
                 }
-                Err(_) => continue, // transient read error on a non-blocking-ish pipe; retry until deadline
+                Err(std_mpsc::RecvTimeoutError::Timeout) => continue, // nothing yet; re-check deadline/boundary
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ProviderError::ExecutionError(
+                        "larql backend: child stdout closed before a turn-boundary signal \
+                         (the 'larql chat' process likely crashed mid-generation)"
+                            .to_string(),
+                    ));
+                }
             }
         }
 
@@ -441,11 +487,13 @@ impl LocalInferenceBackend for LarqlBackend {
 ///    answer.
 fn tiny_model_prompt() -> String {
     let context = crate::prompt_template::tiny_model_context();
-    crate::prompt_template::render_template("larql_tiny_model_system.md", &context).unwrap_or_else(|e| {
-        tracing::warn!("larql backend: failed to load larql_tiny_model_system.md: {e:?}");
-        "You are Goose, an AI coding assistant. When asked to write code, output only the code."
-            .to_string()
-    })
+    crate::prompt_template::render_template("larql_tiny_model_system.md", &context).unwrap_or_else(
+        |e| {
+            tracing::warn!("larql backend: failed to load larql_tiny_model_system.md: {e:?}");
+            "You are Goose, an AI coding assistant. When asked to write code, output only the code."
+                .to_string()
+        },
+    )
 }
 
 fn flatten_prompt(system: &str, messages: &[Message]) -> String {
